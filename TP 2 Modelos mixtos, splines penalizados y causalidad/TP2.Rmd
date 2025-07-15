@@ -1,0 +1,426 @@
+---
+title: "TP 2: Modelos mixtos, splines penalizados y causalidad"
+author: "Florencia Fontana Walser, Jerónimo Barragán, Lorenzo Gandolfo"
+date: "2025-07-09"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(knitr)
+library(lme4)
+library(ggrepel)
+library(viridis)  
+library(mgcv)
+library(caret)
+library(ranger)
+library(xgboost)
+```
+
+## 1. Análisis exploratorio
+
+```{r, echo=TRUE, warning=FALSE, results='hide'}
+titles  <- read.csv("titles_train.csv",  stringsAsFactors = FALSE)
+credits <- read.csv("credits_train.csv", stringsAsFactors = FALSE)
+
+dim(titles)    
+dim(credits)   
+
+str(titles)
+str(credits)
+```
+
+```{r}
+colSums(is.na(titles))
+colSums(is.na(credits))
+
+sort(table(titles$production_countries), decreasing = TRUE) %>% head(10)
+
+table(credits$role)
+```
+
+Vemos que hay nulos en imdb_score y imdb_votes. Tomamos la decisión de eliminar estas filas ya que el porcentaje de faltantes no es muy alto. Además notar que existe una alta concentración de títulos en EE.UU. e India (quizás es bueno tener en cuenta esto a la hora de modelar efectos de país).
+
+```{r}
+titles <- titles %>% 
+  drop_na(imdb_score, imdb_votes)
+```
+
+```{r}
+summary(titles$imdb_score)
+summary(titles$imdb_votes)
+summary(titles$runtime)
+summary(titles$release_year)
+```
+
+```{r}
+titles$comedia <- grepl("comedy", titles$genres)
+prop.table(table(titles$comedia))
+
+```
+
+El 41% de la muestra tiene incluido el género comedia.
+
+```{r}
+credits %>%
+  filter(role == "ACTOR") %>%
+  count(name, sort = TRUE) %>%
+  head(10)
+
+credits %>%
+  filter(role == "ACTOR") %>%
+  count(name, sort = TRUE) %>%
+  slice_head(n = 10)
+```
+
+Bien, respondamos algunas preguntas que sugiere el enunciado.
+
+### ¿Hay algún género que parezca estar más asociado con el puntaje del título?
+
+```{r}
+genres_long <- titles %>%
+  mutate(
+    genres = str_remove_all(genres, "\\[|\\]|'") 
+  ) %>%
+  separate_rows(genres, sep = ",\\s*") %>%
+  mutate(genres = str_trim(genres))
+```
+
+```{r}
+genre_stats <- genres_long %>%
+  group_by(genres) %>%
+  summarise(
+    n           = n(),
+    mean_score  = mean(imdb_score),
+    sd_score    = sd(imdb_score)
+  ) %>%
+  filter(n >= 30) %>%       # umbral para tener suficiente muestra
+  arrange(desc(mean_score))
+
+```
+
+```{r}
+ggplot(genre_stats, aes(x = reorder(genres, mean_score), y = mean_score)) +
+  geom_col() +
+  coord_flip() +
+  labs(title="Puntaje medio por género (n≥30)",
+       x="Género", y="IMDB score medio")
+```
+
+Las películas de guerra, historia y documentales suelen recibir las mejores calificaciones, mientras que el horror, el cine familiar y los thrillers tienden a quedar por debajo del promedio.
+
+### ¿Hay algún actor o director asociado con mayores o menores puntajes?
+
+```{r}
+cred_scores <- credits %>%
+  inner_join(titles, by="id")
+
+```
+
+```{r}
+person_stats <- cred_scores %>%
+  group_by(name, role) %>%
+  summarise(
+    n_titles   = n(),
+    mean_score = mean(imdb_score),
+    sd_score   = sd(imdb_score),
+    .groups    = "drop"
+  ) %>%
+  filter(n_titles >= 5)
+
+top_actors <- person_stats %>%
+  filter(role == "ACTOR") %>%
+  arrange(desc(mean_score)) %>%
+  slice_head(n = 10)
+
+bottom_actors <- person_stats %>%
+  filter(role == "ACTOR") %>%
+  arrange(mean_score) %>%
+  slice_head(n = 10)
+kable(top_actors,    caption = "Top 10 actores (>=5 títulos) por IMDb score medio")
+kable(bottom_actors, caption = "Top 10 actores con menor score medio")
+
+
+```
+
+```{r}
+top_dirs <- person_stats %>%
+  filter(role == "DIRECTOR") %>%
+  arrange(desc(mean_score)) %>%
+  slice_head(n = 10)
+
+bottom_dirs <- person_stats %>%
+  filter(role == "DIRECTOR") %>%
+  arrange(mean_score) %>%
+  slice_head(n = 10)
+
+kable(top_dirs,    caption = "Top 10 directores (>=5 títulos) por IMDb score medio")
+kable(bottom_dirs, caption = "Top 10 directores con menor score medio")
+```
+
+Definitivamente hay actores y directores asociados a puntajes más altos y otros cuyo historial de títulos tiende a puntuar más bajo.
+
+## 2. Predecir puntaje de IMDb en función del país de origen
+
+Como hay películas que tienen más de un país de origen, las sacamos.
+
+```{r}
+titles_sc <- titles %>%
+  mutate(tmp = str_remove_all(production_countries, "\\[|\\]|'"),
+         tmp = str_trim(tmp),
+         pcs = str_split(tmp, ",\\s*")) %>%
+  filter(lengths(pcs) == 1) %>%
+  unnest(pcs) %>%
+  rename(country = pcs) %>%
+  mutate(country = factor(country))
+```
+
+## a)
+
+```{r}
+lm_fe_lm <- lm(imdb_score ~ country, data = titles_sc)
+fe_coefs_lm <- coef(lm_fe_lm)
+
+
+fixed_countries <- sub("^country", "", names(fe_coefs_lm)[-1])
+fixed_vals      <- fe_coefs_lm[-1]
+```
+
+## b)
+
+```{r}
+re_mod2   <- lmer(imdb_score ~ 1 + (1 | country), data = titles_sc)
+re_df2    <- ranef(re_mod2)$country
+re_coefs2 <- re_df2[ , "(Intercept)"]
+names(re_coefs2) <- rownames(re_df2)
+
+```
+
+## c)
+
+```{r}
+common2 <- intersect(fixed_countries, names(re_coefs2))
+
+effects2 <- tibble(
+  country = common2,
+  fixed   = fixed_vals[paste0("country", country)],
+  random  = re_coefs2[country]
+)
+
+counts <- titles_sc %>% count(country) %>% rename(n = n)
+effects2 <- effects2 %>% left_join(counts, by = "country")
+
+ggplot(effects2, aes(x = fixed, y = random, label = country, color = n)) +
+  geom_abline(slope = 1, intercept = 0, linetype="dashed", color="gray50") +
+  geom_point(size = 3) +
+  geom_text_repel(size = 3, max.overlaps = Inf) +
+  scale_color_viridis_c(trans="log10", name="Log10(# títulos)") +
+  labs(
+    title    = "Efectos fijos vs. aleatorios (solo un país)",
+    subtitle = "Color = log10 de la cantidad de títulos por país",
+    x        = expression(beta[k]~"(fijo)"),
+    y        = expression(gamma[k]~"(aleatorio)")
+  ) +
+  theme_minimal()
+```
+
+En nuestro diagrama de **βₖ (efecto fijo)** vs. **γₖ (efecto aleatorio)**, con el color indicando el `log₁₀` del número de títulos por país, se ven tres comportamientos clave:
+
+1.  **Países con muy pocos títulos** (violeta oscuro): sus **βₖ** están muy dispersos a lo largo del eje X (efectos fijos extremos, positivos o negativos). Sin embargo, sus **γₖ** (efectos aleatorios) aparecen más concentrados en el eje Y. Esto ilustra el *shrinkage*: al tener poca información, el modelo mixto “aplasta” esas estimaciones hacia la media global.
+
+2.  **Países de rango medio de títulos** (tonos intermedios de violeta y verde): muestran **menos variabilidad** en βₖ que los de conteo bajo, y sin embargo **un poco más** de dispersión en γₖ. Su shrinkage es más moderado: el modelo aleatorio corrige algo, pero no tanto como en el caso de observaciones escasas.
+
+3.  **Países con muchos títulos** (amarillo claro, p. ej. US, IN): sus **βₖ** se agrupan en una zona relativamente estrecha del eje X.
+
+Cuanto menos datos tiene un país, más confiamos en la media global (shrinkage fuerte) y menos en su estimación puntual (βₖ extrema). A medida que aumenta el volumen de películas, el modelo mixto se comporta cada vez más como el modelo fijo, validando el uso de efectos aleatorios para regularizar estimaciones en niveles con poca información.
+
+## 3. Popularidad en base a `release_year`
+
+Para trazar las curvas emplearemos un modelo aditivo generalizado (GAM) con splines cúbicos de regresión (`bs = "cr"`) y penalización de rugosidad nula (`λ = 0`) para capturar de forma flexible la relación entre el año de estreno (`release_year`) y la calificación de IMDb (`imdb_score`). Al variar el número de nodos (`k = 1, 2, 3, 5, 10, 20, 50`), podremos comparar visualmente cómo cambia la forma de la tendencia a lo largo del tiempo según aumentemos la complejidad del spline, sin incorporar suavizado adicional. Esto nos permitirá identificar el nivel de detalle adecuado para describir la evolución de los puntajes sin sobreajustar el modelo.
+
+```{r spline-popularity, message=FALSE, warning=FALSE}
+ks <- c(1, 2, 3, 5, 10, 20, 50)
+anios   <- seq(min(titles$release_year),
+              max(titles$release_year),
+              length.out = 300)
+
+newdat <- data.frame(release_year = anios)
+
+# ajustar un GAM por cada k y sacar la curva
+all_preds <- lapply(ks, function(k) {
+  fit <- gam(imdb_score ~ s(release_year, bs = "cr", k = k, sp = 0),
+             data = titles)
+  data.frame(
+    release_year = anios,
+    imdb_score    = predict(fit, newdata = newdat),
+    k             = factor(k, levels = ks)
+  )
+}) %>% 
+  do.call(what = rbind)
+
+ggplot(all_preds, aes(x = release_year, y = imdb_score, color = k)) +
+  geom_line(size = 1) +
+  scale_color_brewer("Nodos (k)", palette = "Dark2") +
+  labs(
+    title    = "IMDB Score estimado vs. Año de estreno\nSplines cúbicos sin penalización (λ=0)",
+    x        = "Año de estreno",
+    y        = "Popularidad",
+    subtitle = "Comparación de curvas para distintos números de nodos"
+  ) +
+  theme_minimal()
+
+```
+
+Con muy pocos nodos (k=1–3) las curvas quedan demasiado rígidas. Con muchísimos nodos (k=20, 50) y λ = 0 (no hay ninguna penalización de rugosidad) vemos una oscilación extrema. Un número intermedio de nodos (por ejemplo, k=5 o k=10) parecería ofrecer un trade-off. Agreguemos los datos reales al gráfico para mejorar el análisis.
+
+```{r spline-popularity-con-datos, message=FALSE, warning=FALSE}
+ggplot() +
+  # datos reales
+  geom_point(data = titles, 
+             aes(x = release_year, y = imdb_score),
+             color = "gray70", alpha = 0.4, size = 1) +
+  # curvas estimadas
+  geom_line(data = all_preds, 
+            aes(x = release_year, y = imdb_score, color = k),
+            size = 1) +
+  scale_color_brewer("Nodos (k)", palette = "Dark2") +
+  labs(
+    title    = "IMDb Score vs. Año de estreno",
+    subtitle = "Splines cúbicos sin penalización (λ = 0) y datos reales",
+    x        = "Año de estreno",
+    y        = "IMDb Score"
+  ) +
+  theme_minimal()
+```
+
+Al añadir los puntos reales al gráfico, podemos apreciar claramente la densidad y variabilidad de los `imdb_score` a lo largo del tiempo. Las curvas con muy pocos nodos (k = 1–3) quedan demasiado rígidas, pasando casi siempre por el centro de la nube de datos y perdiendo detalles de cambios reales. Por otro lado, las curvas con muchos nodos (k = 20, 50) se adaptan en exceso al ruido, mostrando oscilaciones que no se corresponden con ninguna tendencia subyacente.
+
+Un valor intermedio de nodos (k = 5 – 10) captura las variaciones generales (picos y valles suaves) sin sobreadaptarse a cada punto aislado. Esto sugiere que, si quisiéramos un spline cúbico sin penalización que refleje de manera realista la evolución de las puntuaciones de IMDb según el año de estreno, un `k` de alrededor de 5 o 10 sería el mejor compromiso entre sesgo y varianza.
+
+## 4. A qué subconjunto de las variables `Año`, `Duración` y `País` se debe condicionar para estimar el efecto causal promedio de la variable `Comedia` sobre el `Score`?
+
+Dado el DAG:
+
+```{r}
+knitr::include_graphics("DAG.png")
+```
+
+El único camino de “back-door” que conecta `Comedia` con `Score` es:
+
+`Comedia` ← `País` → `Duración` → `Score`
+
+Para bloquear ese sesgo sin tocar mediadores (`Duración`) y sin abrir otros caminos:
+
+-   Condicionar en `País` rompe el único back-door.
+-   **No** deben ajustarse ni `Duración` (es mediador) ni solo `Año` (no bloquea el back-door).
+-   Incluir `Año` además de `País` **no** introduce sesgo extra, pero tampoco es necesario.
+
+### Conjuntos de ajuste válidos
+
+1.  **Mínimo**: {`País`}
+
+2.  **Superset también válido**: {`País`, `Año`}
+
+Cualquier otro subconjunto de {`Año`, `Duración`, `País`} introduce sesgo o deja el back-door abierto.
+
+## 5. Comparación de modelos predictivos para `imdb_score`
+
+A continuación dividimos el dataset en entrenamiento y testeo (80/20), probamos tres modelos distintos y comparamos su RMSE en el conjunto de test:
+
+```{r model-comparison, message=FALSE, echo=TRUE, warning=FALSE, results='hide'}
+data_mod <- titles %>%
+  mutate(
+    comedia           = factor(comedia),
+    type              = factor(type),
+    age_certification = factor(age_certification)
+  ) %>%
+  select(imdb_score, release_year, runtime, imdb_votes, comedia, type, age_certification)
+
+set.seed(123)
+train_idx <- createDataPartition(data_mod$imdb_score, p = 0.8, list = FALSE)
+train <- data_mod[train_idx, ]
+test  <- data_mod[-train_idx, ]
+
+# 5-fold CV
+ctrl <- trainControl(method = "cv", number = 5)
+
+set.seed(123)
+mod_lm <- train(imdb_score ~ ., data = train,
+                method    = "lm",
+                trControl = ctrl)
+set.seed(123)
+mod_rf <- train(imdb_score ~ ., data = train,
+                method    = "ranger",
+                trControl = ctrl,
+                tuneLength = 3)
+set.seed(123)
+mod_xgb <- train(imdb_score ~ ., data = train,
+                 method     = "xgbTree",
+                 trControl  = ctrl,
+                 tuneLength = 3)
+```
+
+
+```{r}
+pred_lm  <- predict(mod_lm,  test)
+pred_rf  <- predict(mod_rf,  test)
+pred_xgb <- predict(mod_xgb, test)
+
+rmse_lm  <- RMSE(pred_lm,  test$imdb_score)
+rmse_rf  <- RMSE(pred_rf,  test$imdb_score)
+rmse_xgb <- RMSE(pred_xgb, test$imdb_score)
+
+results <- tibble(
+  Modelo = c("Regresión lineal", "Random Forest", "XGBoost"),
+  RMSE   = c(rmse_lm, rmse_rf, rmse_xgb)
+)
+
+print(results)
+```
+
+Como el modelo de Random Forest tiene el menor RMSE, lo utilizaremos para computar nuestras predicciones del siguiente punto.
+
+## 6. Predicción de score de nuevos títulos
+
+```{r generar-predicciones, message=FALSE, warning=FALSE}
+titles_test <- read.csv("titles_test.csv", stringsAsFactors = FALSE)
+
+med_runtime <- median(train$runtime,  na.rm = TRUE)
+med_votes   <- median(train$imdb_votes, na.rm = TRUE)
+
+titles_test_mod <- titles_test %>%
+  mutate(
+    comedia = factor(
+      grepl("comedy", genres, ignore.case = TRUE),
+      levels = levels(train$comedia)
+    ),
+    type              = factor(type,              levels = levels(train$type)),
+    age_certification = factor(age_certification, levels = levels(train$age_certification)),
+    runtime    = ifelse(is.na(runtime),    med_runtime, runtime),
+    imdb_votes = ifelse(is.na(imdb_votes), med_votes,   imdb_votes)
+  )
+
+titles_test_mod2 <- titles_test_mod %>% mutate(
+  imdb_votes = ifelse(is.na(imdb_votes), med_votes, imdb_votes)
+)
+
+pred_rf_test <- predict(mod_rf, newdata = titles_test_mod2)
+
+stopifnot(length(pred_rf_test) == nrow(titles_test))
+
+write.table(
+  data.frame(prediction = pred_rf_test),
+  file      = "predicciones.csv",
+  col.names = FALSE,
+  row.names = FALSE
+)
+```

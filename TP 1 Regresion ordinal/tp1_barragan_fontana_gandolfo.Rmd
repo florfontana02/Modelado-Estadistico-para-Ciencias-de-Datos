@@ -1,0 +1,255 @@
+---
+title: "Modelado Estadístico: Regresión Ordinal"
+author: "Barragán (LU: 1472/21), Fontana (LU: 1530/21), Gandolfo (LU: 169/21)."
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Trabajo Práctico 1
+
+```{r,include=FALSE}
+library(tidyverse)
+library(MASS)
+#library(rstanarm)
+options(mc.cores = parallel::detectCores())
+#rstan_options(auto_write = TRUE)
+set.seed(123)
+```
+
+# 1.
+
+```{r,include=FALSE}
+datos <- read_table("data.csv")
+
+n_total <- nrow(datos)
+idx_train <- sample(seq_len(n_total), size = floor(0.7 * n_total))
+datos_train <- datos[idx_train, ]
+datos_test  <- datos[-idx_train, ]
+
+
+nrow(datos_train)
+nrow(datos_test)
+```
+
+Filtramos nulos y valores sin sentido de la columna age, que se usará más adelante.
+
+```{r}
+datos_train <- datos_train %>%
+  filter(!is.na(Q43), Q43 %in% 1:5, !is.na(Q9), !is.na(age)) %>%
+  mutate(age_numeric = as.numeric(as.character(age))) %>%
+  filter(age_numeric >= 13, age_numeric <= 100) %>%
+  mutate(Q43_ord = factor(Q43, levels = 1:5, ordered = TRUE))
+
+datos_test <- datos_test %>%
+  filter(!is.na(Q43), Q43 %in% 1:5, !is.na(Q9), !is.na(age)) %>%
+  mutate(age_numeric = as.numeric(as.character(age))) %>%
+  filter(age_numeric >= 13, age_numeric <= 100) %>%
+  mutate(Q43_ord = factor(Q43, levels = 1:5, ordered = TRUE))
+
+```
+
+# 2.
+
+Elegimos la pregunta 43:
+
+Q43: I think a natural disaster would be kind of exciting.
+
+# 3.
+
+La regresión lineal asume que la variable de respuesta es continua y no acotada en $\mathbb{R}$. En cambio, $Q$ (por ejemplo, $Q_{43}$) es una escala Likert ordinal con valores enteros $\{1,2,3,4,5\}$, por lo que un modelo lineal puede predecir valores no enteros o fuera del rango $[1,5]$ (por ejemplo, $5.8$ o $0.3$), lo cual no tendría sentido.
+
+El modelo multinomial (para distribución categórica con $K=5$ posibles resultados) estima $K - 1 = 4$ ecuaciones de log-odds independientes: $$
+    \log\bigl(\mathrm{odds}(Y = k \mid X)\bigr) \;=\; \beta_{0k} + \beta_{1k} X_1 + \cdots, 
+    \quad k=2,3,4,5,
+  $$ tomando, por ejemplo, la categoría $1$ como referencia. Este planteo ignora completamente el orden intrínseco entre las categorías $1 < 2 < 3 < 4 < 5$. Tratar un "5" como clase independiente no aprovecha que un "5" es "más cercano" a un "4" que a un "1". Como no se impone ningún criterio de orden, puede dar probabilidades que no respeten la secuencia, lo que hace difícil interpretarlo cuando sí hay un sentido creciente entre niveles.
+
+# 4.
+
+La regresión ordinal resuelve los problemas anteriores aprovechando el orden de las categorías al modelar la probabilidad acumulada de que la respuesta caiga "en o por debajo" de cada nivel, en lugar de tratar cada categoría como independiente. Con un solo conjunto de coeficientes, el modelo estima cómo las variables predictoras desplazan ese puntaje hacia niveles más bajos o más altos. Así, las probabilidades resultantes siempre respetan el orden natural: si un predictor se modifica, la probabilidad acumulada de estar en categorías superiores crece/disminuye de manera ordenada, sin saltos incoherentes entre niveles.
+
+# 5.
+
+Primero entrenamos el modelo.
+
+```{r}
+modelo_ordinal <- polr(Q43_ord ~ age_numeric, data = datos_train, Hess = TRUE)
+
+summary(modelo_ordinal)
+```
+
+El coeficiente es negativo y muy pequeño en valor absoluto (−0.021). Eso significa que, a medida que la edad aumenta en 1 año, la probabilidad de pertenecer a categorías “más altas” disminuye muy suavemente.
+
+Evaluamos el modelo en nuestro conjunto de test.
+
+```{r}
+pred_test_ordinal <- predict(modelo_ordinal, 
+                     newdata = datos_test, 
+                     type   = "class")  
+#matriz de confusion
+cm <- table(Predicho = pred_test_ordinal, Real = datos_test$Q43_ord)
+print(cm)
+
+pred_num <- as.numeric(as.character(pred_test_ordinal))
+real_num <- as.numeric(as.character(datos_test$Q43_ord))
+accuracy_num <- mean(pred_num == real_num)
+cat("Accuracy (comparando como números):", accuracy_num, "\n")
+```
+
+Dado que las edades oscilan entre 13 y 100 (filtrado propio basándonos en la información de la encuesta), ese cambio tan gradual apenas mueve las probabilidades: para prácticamente toda la franja de edades, la categoría 1 sigue siendo la más probable. Por eso, al pedirle `type="class"`, el modelo “elige siempre 1” como la categoría de máxima probabilidad, aun para edades grandes o chicas.
+
+```{r}
+
+real_num <- as.numeric(as.character(datos_test$Q43_ord))
+pred_num <- as.numeric(as.character(pred_test_ordinal))
+
+MAE <- mean(abs(pred_num - real_num))
+cat("Mean Absolute Error (MAE) en el test set:", MAE, "\n")
+
+```
+
+Un MAE de \~1.65, junto a que la mayoría de las predicciones quedaron en “1”, sugiere que la edad por sí sola tiene muy poca capacidad para diferenciar las respuestas 1–5.
+
+# 6.
+
+Para estimar esa probabilidad, primero filtramos el conjunto de datos para quedarnos solo con las personas que tienen `age_numeric == 25` y un valor válido en Q9; luego contamos cuántas de esas personas tienen Q9 ≥ 4 (“al menos de acuerdo”) y dividimos ese conteo por el total de la submuestra de 25 años; la proporción resultante se usa como estimador puntual de la probabilidad buscada.
+
+```{r}
+sub25 <- datos_train %>%
+  filter(age_numeric == 25, !is.na(Q9))
+
+prob_25_acuerdo <- mean(sub25$Q9 >= 4, na.rm = TRUE)
+prob_25_acuerdo
+
+```
+
+# 7.
+
+```{r}
+loss_L <- function(y, y_pred) {
+  y_pred_cat <- pmin(pmax(round(y_pred), 1), 5)
+  mean(abs(y - y_pred_cat))
+}
+
+```
+
+# 8.
+
+Entrenamos el modelo lineal.
+
+```{r}
+y_train_num   <- as.integer(datos_train$Q43_ord)
+modelo_lineal <- lm(y_train_num ~ age_numeric, data = datos_train)
+
+pred_cont <- predict(modelo_lineal, newdata = datos_test)
+
+# redondeamos al rango deseado
+pred_cat <- pmin(pmax(round(pred_cont), 1), 5)
+```
+
+# 9.
+
+```{r}
+y_test_num <- as.integer(datos_test$Q43_ord)
+
+# perdida del modelo ordinal
+pred_test_ordinal <- predict(modelo_ordinal, newdata = datos_test, type = "class")
+pred_ord_num      <- as.numeric(as.character(pred_test_ordinal))
+loss_ord          <- loss_L(y_test_num, pred_ord_num)
+
+# ajustar y predecir con el modelo lineal
+y_train_num   <- as.integer(datos_train$Q43_ord)
+modelo_lm     <- lm(y_train_num ~ age_numeric, data = datos_train)
+pred_lm_cont  <- predict(modelo_lm, newdata = datos_test)
+loss_lm       <- loss_L(y_test_num, pred_lm_cont)
+
+
+cat("Pérdida L (ordinal):", loss_ord, "\n")
+cat("Pérdida L (lineal+round):", loss_lm, "\n")
+```
+
+Que el modelo lineal (con redondeo) obtiene una pérdida L=1.3724, que es menor que la del modelo ordinal (L=1.6460). En otras palabras, en promedio la predicción entera del modelo lineal queda 1.37 categorías lejos de la real, mientras que la del ordinal se queda 1.65 categorías fuera. Por lo tanto, bajo la función de pérdida L definida, el modelo lineal + redondeo es más preciso y, en este sentido, preferible al modelo ordinal.
+
+#10.
+
+```{r,include=FALSE}
+datos_train_bayes <- datos_train %>%
+  filter(!is.na(Q9)) %>%
+  mutate(
+    Q9_ord = factor(Q9, levels = 1:5, ordered = TRUE)
+  )
+
+datos_test_bayes <- datos_test %>%
+  filter(!is.na(Q9)) %>%
+  mutate(
+    Q9_ord = factor(Q9, levels = 1:5, ordered = TRUE)
+  )
+
+library(rstanarm)
+
+
+fit_bayes1 <- stan_polr(
+  Q9_ord ~ age_numeric,
+  data         = datos_train_bayes,
+  prior        = R2(location = 0.33, what='mean'),
+  prior_counts = NULL,
+  algorithm= 'fullrank',
+  seed         = 123
+)
+
+fit_bayes2 <- stan_polr(
+  Q9_ord ~ age_numeric,
+  data         = datos_train_bayes,
+  prior        = R2(location = 0.66, what='mean'),
+  prior_counts = NULL,
+  algorithm= 'fullrank',
+  seed         = 123
+)
+
+fit_bayes3 <- stan_polr(
+  Q9_ord ~ age_numeric,
+  data         = datos_train_bayes,
+  prior        = R2(location = 0.99, what='mean'),
+  prior_counts = NULL,
+  algorithm= 'fullrank',
+  seed         = 123
+)
+
+post1 <- as.data.frame(fit_bayes1, pars = "age_numeric")
+post2 <- as.data.frame(fit_bayes2, pars = "age_numeric")
+post3 <- as.data.frame(fit_bayes3, pars = "age_numeric")
+
+colnames(post1) <- "beta_age"; post1$prior <- "N(0,1)"
+colnames(post2) <- "beta_age"; post2$prior <- "N(0,5)"
+colnames(post3) <- "beta_age"; post3$prior <- "t(3,0,2.5)"
+
+posterior_all <- bind_rows(post1, post2, post3)
+
+
+```
+
+```{r}
+library(ggplot2)
+ggplot(posterior_all, aes(x = beta_age, color = prior, fill = prior)) +
+  geom_density(alpha = 0.3, size = 1) +
+  labs(
+    x     = expression(beta[edad]),
+    y     = "Densidad posterior",
+    title = "Distribuciones posteriores de β_edad según distintas priors"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title   = element_text(hjust = 0.5),
+    legend.title = element_blank()
+  )
+```
+
+```{}
+```
+
+Se podría concluir que la posterior de los $\beta$ casi no cambia al variar la prior, lo que indica que la información de los datos es tan fuerte que domina el resultado y la prior apenas influye.
